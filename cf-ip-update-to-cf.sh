@@ -31,9 +31,9 @@ set -o pipefail
 # Cloudflare 配置
 # ==========================================================
 
-CF_API_TOKEN="YvkOMowzv6qdEPO3gUGEiDZgbubGLm9ksjhFvnWW"
+CF_API_TOKEN="YvkOMowzv6gdfgdgdgfdgbbbGLm9ksjhFvnWW"
 
-ZONE_ID="e7eb4b0d773392130965c7f7cd23bfc0"
+ZONE_ID="e7eb4b0d7werewrwfdshj7ughdfdcd23bfc0"
 
 TTL=60
 
