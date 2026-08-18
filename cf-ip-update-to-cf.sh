@@ -31,9 +31,9 @@ set -o pipefail
 # Cloudflare 配置
 # ==========================================================
 
-CF_API_TOKEN="YvkOMgdfgdgdEhhhdfgdgdgdgubGLm9ksjhFvnWW"
+CF_API_TOKEN="YvkOMowzv6qdEPO3gUGEiDZgbubGLm9ksjhFvnWW"
 
-ZONE_ID="e7eb4b0fgdfgfdgdg7f7cd23bfc0"
+ZONE_ID="e7eb4b0d773392130965c7f7cd23bfc0"
 
 TTL=60
 
@@ -1695,6 +1695,296 @@ process_domain() {
 
 
 # ==========================================================
+# 手动为所有 domains.conf 域名设置统一 IP
+# ==========================================================
+
+set_all_domains_same_ip() {
+
+    load_domains
+
+    clear
+
+    separator
+    echo " 手动设置所有域名统一 IP"
+    separator
+    echo
+
+    if [ "${#DOMAINS[@]}" -eq 0 ]; then
+        echo "domains.conf 中没有配置任何域名。"
+        echo
+        return
+    fi
+
+    echo "将会处理以下 ${#DOMAINS[@]} 个域名："
+    echo
+
+    for ((i=0; i<${#DOMAINS[@]}; i++)); do
+        echo "  $((i+1)). ${DOMAINS[$i]}"
+    done
+
+    echo
+
+    # ------------------------------------------------------
+    # 输入 IP
+    # ------------------------------------------------------
+
+    read -rp "请输入统一 IP： " UNIFIED_IP
+
+    UNIFIED_IP=$(echo "$UNIFIED_IP" | xargs)
+
+    # ------------------------------------------------------
+    # 验证 IPv4
+    # ------------------------------------------------------
+
+    if ! [[ "$UNIFIED_IP" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+
+        echo
+        echo "[ERROR] IP 地址格式错误：$UNIFIED_IP"
+        echo
+
+        return 1
+    fi
+
+    IFS='.' read -r IP1 IP2 IP3 IP4 <<< "$UNIFIED_IP"
+
+    if [ "$IP1" -gt 255 ] ||
+       [ "$IP2" -gt 255 ] ||
+       [ "$IP3" -gt 255 ] ||
+       [ "$IP4" -gt 255 ]; then
+
+        echo
+        echo "[ERROR] 无效 IPv4 地址：$UNIFIED_IP"
+        echo
+
+        return 1
+    fi
+
+    # ------------------------------------------------------
+    # 二次确认
+    # ------------------------------------------------------
+
+    echo
+    separator
+
+    echo "即将执行："
+    echo
+
+    echo "所有 ${#DOMAINS[@]} 个域名"
+    echo "        ↓"
+    echo "统一设置为"
+    echo "        ↓"
+    echo "$UNIFIED_IP"
+
+    echo
+    echo "注意："
+    echo "每个域名现有的 A 记录都会被删除。"
+    echo "最终每个域名只保留一个 A 记录：$UNIFIED_IP"
+    echo
+
+    separator
+    echo
+
+    read -rp "确定执行吗？请输入 YES 确认： " CONFIRM
+
+    if [ "$CONFIRM" != "YES" ]; then
+
+        echo
+        echo "操作已取消。"
+        echo
+
+        return 0
+    fi
+
+    # ------------------------------------------------------
+    # Cloudflare API 检查
+    # ------------------------------------------------------
+
+    if ! check_cloudflare_api; then
+
+        echo
+        echo "[ERROR] Cloudflare API 检测失败，操作终止。"
+        echo
+
+        return 1
+    fi
+
+    # ------------------------------------------------------
+    # 开始处理
+    # ------------------------------------------------------
+
+    echo
+
+    separator
+    echo "开始设置统一 IP"
+    separator
+    echo
+
+    local TOTAL="${#DOMAINS[@]}"
+    local SUCCESS=0
+    local FAILED=0
+
+    for ((i=0; i<TOTAL; i++)); do
+
+        DOMAIN="${DOMAINS[$i]}"
+
+        echo
+        echo "[$((i+1))/$TOTAL] 处理：$DOMAIN"
+
+        log INFO "手动统一 IP：开始处理 $DOMAIN -> $UNIFIED_IP"
+
+        # --------------------------------------------------
+        # 查询现有 A 记录
+        # --------------------------------------------------
+
+        RECORD_DATA=$(get_dns_records "$DOMAIN" 2>/dev/null)
+
+        if [ $? -ne 0 ]; then
+
+            echo "[ERROR] 无法获取 $DOMAIN 的 DNS 记录"
+
+            log ERROR "手动统一 IP：$DOMAIN 获取 DNS 记录失败"
+
+            ((FAILED++))
+
+            continue
+        fi
+
+        # --------------------------------------------------
+        # 判断是否已经是唯一统一 IP
+        # --------------------------------------------------
+
+        CURRENT_IPS=$(
+            echo "$RECORD_DATA" |
+            cut -d'|' -f2 |
+            sed '/^$/d' |
+            sort -u
+        )
+
+        CURRENT_COUNT=$(
+            echo "$CURRENT_IPS" |
+            sed '/^$/d' |
+            wc -l
+        )
+
+        if [ "$CURRENT_COUNT" -eq 1 ] &&
+           [ "$CURRENT_IPS" = "$UNIFIED_IP" ]; then
+
+            echo "[SKIP] $DOMAIN 已经是 $UNIFIED_IP"
+
+            log INFO "手动统一 IP：$DOMAIN 已经是 $UNIFIED_IP，跳过"
+
+            ((SUCCESS++))
+
+            continue
+        fi
+
+        # --------------------------------------------------
+        # 先创建目标 IP
+        # --------------------------------------------------
+
+        echo "[INFO] 创建目标 IP：$UNIFIED_IP"
+
+        if ! create_dns_record "$DOMAIN" "$UNIFIED_IP"; then
+
+            echo "[ERROR] $DOMAIN 创建新 IP 失败"
+
+            log ERROR "手动统一 IP：$DOMAIN 创建 $UNIFIED_IP 失败"
+
+            ((FAILED++))
+
+            continue
+        fi
+
+        # --------------------------------------------------
+        # 重新获取 DNS 记录
+        # --------------------------------------------------
+
+        NEW_RECORD_DATA=$(get_dns_records "$DOMAIN" 2>/dev/null)
+
+        if [ $? -ne 0 ]; then
+
+            echo "[ERROR] $DOMAIN 创建后重新查询 DNS 失败"
+
+            log ERROR "手动统一 IP：$DOMAIN 创建后重新查询失败"
+
+            ((FAILED++))
+
+            continue
+        fi
+
+        # --------------------------------------------------
+        # 删除所有不是目标 IP 的记录
+        # --------------------------------------------------
+
+        DELETE_FAILED=0
+
+        while IFS='|' read -r RECORD_ID RECORD_IP; do
+
+            [ -z "$RECORD_ID" ] && continue
+
+            # 目标 IP 保留
+            if [ "$RECORD_IP" = "$UNIFIED_IP" ]; then
+                continue
+            fi
+
+            echo "[INFO] 删除旧 IP：$RECORD_IP"
+
+            if ! delete_dns_record "$DOMAIN" "$RECORD_ID"; then
+
+                DELETE_FAILED=1
+
+                echo "[ERROR] 删除失败：$RECORD_IP"
+
+            fi
+
+        done <<< "$NEW_RECORD_DATA"
+
+        # --------------------------------------------------
+        # 检查最终状态
+        # --------------------------------------------------
+
+        if [ "$DELETE_FAILED" -eq 1 ]; then
+
+            echo "[ERROR] $DOMAIN 部分旧记录删除失败"
+
+            log ERROR "手动统一 IP：$DOMAIN 部分旧记录删除失败"
+
+            ((FAILED++))
+
+            continue
+        fi
+
+        echo "[OK] $DOMAIN → $UNIFIED_IP"
+
+        log INFO "手动统一 IP：$DOMAIN → $UNIFIED_IP 成功"
+
+        ((SUCCESS++))
+
+        # 避免 API 请求过于密集
+        sleep 0.5
+
+    done
+
+    echo
+
+    separator
+
+    echo "统一 IP 设置完成"
+
+    echo
+
+    echo "目标 IP：$UNIFIED_IP"
+    echo "域名总数：$TOTAL"
+    echo "成功：$SUCCESS"
+    echo "失败：$FAILED"
+
+    separator
+
+    echo
+
+}
+
+# ==========================================================
 # 手动立即执行
 # ==========================================================
 
@@ -1944,7 +2234,9 @@ interactive_menu() {
 		
 		echo "7. 查看所有域名当前 IP"
 
-        echo "8. 退出"
+        echo "8. 所有域名设置统一 IP"
+	   
+		echo "9. 退出"
 
         echo
 
@@ -2014,8 +2306,15 @@ interactive_menu() {
 				
             8)
 
-                echo
+                set_all_domains_same_ip
 
+                read -rp "按回车继续..." _
+
+                ;;
+			
+			9)
+
+                echo
                 echo "退出。"
 
                 exit 0
