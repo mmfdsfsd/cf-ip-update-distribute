@@ -2241,7 +2241,7 @@ interactive_menu() {
         echo
 
 
-        read -rp "请选择 [1-8]： " MENU
+        read -rp "请选择 [1-9]： " MENU
 
 
         case "$MENU" in
