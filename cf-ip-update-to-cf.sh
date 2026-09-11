@@ -1,8 +1,8 @@
 #!/bin/bash
 
 # ==========================================================
-# Cloudflare 优选 IP 自动分配工具
-#
+# Cloudflare 优选 IP 自动分配工具 
+#  https://ip.164746.xyz
 # 文件：
 #   /usr/local/bin/cf-ip-update-distribute.sh
 #
