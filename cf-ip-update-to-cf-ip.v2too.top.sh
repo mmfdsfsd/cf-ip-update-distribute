@@ -5,6 +5,33 @@
 #
 # SG / JP 地区独立 IP 池
 #
+# 核心更新策略：
+#
+# 1. 当前 DNS IP 数量 < 配置数量
+#    - 只添加 API 中真正新的 IP
+#    - 不删除任何现有 IP
+#    - 尽量补到配置数量
+#    - API 不足时保持现状，等待下一次 Cron
+#
+# 2. 当前 DNS IP 数量 = 配置数量
+#    - API 中出现新的 IP
+#    - 新 IP 替换随机旧 IP
+#    - 新增多少，就随机淘汰多少旧 IP
+#    - 最终始终保持配置数量
+#
+# 3. API 中已经存在于 DNS 的 IP
+#    - 不算新 IP
+#    - 不触发替换
+#
+# 4. API 没有新的可用 IP
+#    - DNS 完全不变
+#
+# 5. 创建新记录失败
+#    - 不删除旧记录
+#    - 回滚本次已经创建成功的新记录
+#
+# 6. SG / JP 完全独立
+#
 # 配置文件：
 #   /root/cf-ip-update/sg-domains.conf
 #   /root/cf-ip-update/jp-domains.conf
@@ -12,12 +39,8 @@
 # 格式：
 #   domain|ip数量
 #
-# 例如：
-#   sg1.example.com|3
-#   sg2.example.com|3
-#
 # Cron：
-#   /usr/local/bin/cf-ip-update-distribute.sh --cron
+#   /root/cf-ip-update/cf-ip-update-to-cf.sh --cron
 #
 # ==========================================================
 
@@ -62,8 +85,6 @@ CARRIER_WEIGHT=5
 #
 # SG -> SIN
 # JP -> NRT
-#
-# API 中 region 必须与这里对应
 # ==========================================================
 
 SG_REGION="SIN"
@@ -72,9 +93,6 @@ JP_REGION="NRT"
 
 # ==========================================================
 # 优先运营商
-#
-# 注意：
-# SG / JP 如果 API carrier 不同，可以分别配置
 # ==========================================================
 
 SG_PREFERRED_CARRIER="ct"
@@ -90,8 +108,6 @@ DEFAULT_MAX_IPS=3
 
 # ==========================================================
 # API IP 最低速度
-#
-# 低于这个速度的节点直接过滤
 # ==========================================================
 
 MIN_SPEED=10
@@ -175,9 +191,9 @@ check_dependencies() {
     command -v sed >/dev/null 2>&1 || MISSING+=("sed")
     command -v sort >/dev/null 2>&1 || MISSING+=("sort")
     command -v flock >/dev/null 2>&1 || MISSING+=("flock")
-    command -v bc >/dev/null 2>&1 || MISSING+=("bc")
     command -v cut >/dev/null 2>&1 || MISSING+=("cut")
     command -v paste >/dev/null 2>&1 || MISSING+=("paste")
+    command -v tr >/dev/null 2>&1 || MISSING+=("tr")
 
     if [ "${#MISSING[@]}" -gt 0 ]; then
 
@@ -186,7 +202,7 @@ check_dependencies() {
         echo
         echo "Debian / Ubuntu："
         echo
-        echo "apt update && apt install -y curl jq gawk grep sed coreutils util-linux bc"
+        echo "apt update && apt install -y curl jq gawk grep sed coreutils util-linux"
         echo
 
         exit 1
@@ -279,7 +295,7 @@ validate_domain() {
 # 参数：
 #   $1 = SG / JP
 #
-# 输出到：
+# 输出：
 #   DOMAINS
 #   DOMAIN_IP_COUNTS
 # ==========================================================
@@ -534,20 +550,21 @@ check_cloudflare_api() {
 # ==========================================================
 # 获取指定地区 API 节点
 #
-# 参数：
-#   $1 = SG / JP
+# API 实际格式：
+#
+# [
+#   {
+#     "ip": "172.64.229.254",
+#     "speed": 81.1,
+#     "latency": 86.69,
+#     "region": "NRT",
+#     "time": "...",
+#     "carrier": "ct"
+#   }
+# ]
 #
 # SG -> SIN
 # JP -> NRT
-#
-# 最终保存：
-#
-# NODE_IPS
-# NODE_SPEEDS
-# NODE_LATENCIES
-# NODE_REGIONS
-# NODE_TIMES
-# NODE_CARRIERS
 # ==========================================================
 
 get_api_nodes() {
@@ -620,8 +637,6 @@ get_api_nodes() {
 
         log ERROR "[$TARGET_REGION] 优选 IP API 返回无效 JSON"
 
-        log ERROR "$RESPONSE"
-
         return 1
     fi
 
@@ -634,10 +649,6 @@ get_api_nodes() {
         return 1
     fi
 
-
-    # ------------------------------------------------------
-    # 提取指定地区节点
-    # ------------------------------------------------------
 
     while IFS=$'\t' read -r \
         IP \
@@ -652,7 +663,7 @@ get_api_nodes() {
 
 
         # --------------------------------------------------
-        # 只允许当前地区
+        # 地区过滤
         # --------------------------------------------------
 
         if [ "$REGION" != "$API_REGION" ]; then
@@ -721,10 +732,6 @@ get_api_nodes() {
     )
 
 
-    # ------------------------------------------------------
-    # 没有节点
-    # ------------------------------------------------------
-
     if [ "${#NODE_IPS[@]}" -eq 0 ]; then
 
         log ERROR \
@@ -790,19 +797,9 @@ get_api_nodes() {
     return 0
 }
 
+
 # ==========================================================
 # 计算指定地区综合评分
-#
-# 参数：
-#   $1 = SG / JP
-#
-# SG：
-#   region = SIN
-#   carrier = SG_PREFERRED_CARRIER
-#
-# JP：
-#   region = NRT
-#   carrier = JP_PREFERRED_CARRIER
 # ==========================================================
 
 calculate_scores() {
@@ -816,61 +813,69 @@ calculate_scores() {
         return 1
     fi
 
-    # ------------------------------------------------------
-    # 根据地区获取评分配置
-    # ------------------------------------------------------
 
     local API_REGION=""
     local PREFERRED_CARRIER=""
 
+
     case "$TARGET_REGION" in
 
         SG)
+
             API_REGION="$SG_REGION"
             PREFERRED_CARRIER="$SG_PREFERRED_CARRIER"
+
             ;;
 
         JP)
+
             API_REGION="$JP_REGION"
             PREFERRED_CARRIER="$JP_PREFERRED_CARRIER"
+
             ;;
 
         *)
-            log ERROR "未知评分地区：$TARGET_REGION"
-            return 1
-            ;;
 
+            log ERROR "未知评分地区：$TARGET_REGION"
+
+            return 1
+
+            ;;
     esac
 
-
-    # ------------------------------------------------------
-    # 清洗 speed / latency
-    # ------------------------------------------------------
 
     local i
     local speed
     local latency
+
+
+    # ------------------------------------------------------
+    # 清洗速度 / 延迟
+    # ------------------------------------------------------
 
     for ((i=0; i<count; i++)); do
 
         speed="${NODE_SPEEDS[$i]:-0}"
         latency="${NODE_LATENCIES[$i]:-0}"
 
-        # 删除非数字字符
+
         speed=$(printf '%s' "$speed" | sed 's/[^0-9.]//g')
         latency=$(printf '%s' "$latency" | sed 's/[^0-9.]//g')
+
 
         [[ -z "$speed" ]] && speed="0"
         [[ -z "$latency" ]] && latency="999999"
 
-        # 必须是合法数字
+
         if ! [[ "$speed" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
             speed="0"
         fi
 
+
         if ! [[ "$latency" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
             latency="999999"
         fi
+
 
         NODE_SPEEDS[$i]="$speed"
         NODE_LATENCIES[$i]="$latency"
@@ -879,13 +884,14 @@ calculate_scores() {
 
 
     # ------------------------------------------------------
-    # 获取最大 / 最小速度
+    # 最大 / 最小速度
     # ------------------------------------------------------
 
     local min_speed
     local max_speed
     local min_latency
     local max_latency
+
 
     min_speed=$(
         printf '%s\n' "${NODE_SPEEDS[@]}" |
@@ -894,14 +900,17 @@ calculate_scores() {
                 min=$1
                 next
             }
+
             $1 < min {
                 min=$1
             }
+
             END {
                 print min+0
             }
         '
     )
+
 
     max_speed=$(
         printf '%s\n' "${NODE_SPEEDS[@]}" |
@@ -910,9 +919,11 @@ calculate_scores() {
                 max=$1
                 next
             }
+
             $1 > max {
                 max=$1
             }
+
             END {
                 print max+0
             }
@@ -921,7 +932,7 @@ calculate_scores() {
 
 
     # ------------------------------------------------------
-    # 获取最大 / 最小延迟
+    # 最大 / 最小延迟
     # ------------------------------------------------------
 
     min_latency=$(
@@ -931,14 +942,17 @@ calculate_scores() {
                 min=$1
                 next
             }
+
             $1 < min {
                 min=$1
             }
+
             END {
                 print min+0
             }
         '
     )
+
 
     max_latency=$(
         printf '%s\n' "${NODE_LATENCIES[@]}" |
@@ -947,9 +961,11 @@ calculate_scores() {
                 max=$1
                 next
             }
+
             $1 > max {
                 max=$1
             }
+
             END {
                 print max+0
             }
@@ -957,11 +973,8 @@ calculate_scores() {
     )
 
 
-    # ------------------------------------------------------
-    # 初始化评分
-    # ------------------------------------------------------
-
     NODE_SCORES=()
+
 
     local speed_score
     local latency_score
@@ -970,10 +983,17 @@ calculate_scores() {
     local final_score
 
     local carrier_lower
+    local preferred_carrier_lower
+
+
+    preferred_carrier_lower=$(
+        printf '%s' "$PREFERRED_CARRIER" |
+        tr '[:upper:]' '[:lower:]'
+    )
 
 
     # ------------------------------------------------------
-    # 开始计算
+    # 开始评分
     # ------------------------------------------------------
 
     for ((i=0; i<count; i++)); do
@@ -984,7 +1004,6 @@ calculate_scores() {
 
         # ==================================================
         # Speed Score
-        # 速度越高越好
         # ==================================================
 
         if awk \
@@ -996,26 +1015,11 @@ calculate_scores() {
         then
 
             speed_score=$(
-                awk \
-                    -v min="$min_speed" \
-                    -v max="$max_speed" \
-                    -v value="$speed" \
-                    'BEGIN {
-                        score=((value-min)/(max-min))*100
-
-                        if (score < 0)
-                            score=0
-
-                        if (score > 100)
-                            score=100
-
-                        printf "%.4f", score
-                    }'
-            )
+				awk -v min="$min_speed" -v max="$max_speed" -v value="$speed" 'BEGIN { score=((value-min)/(max-min))*100; if (score<0) score=0; if (score>100) score=100; printf "%.4f", score }'
+			)
 
         else
 
-            # 所有节点速度相同
             speed_score="100"
 
         fi
@@ -1023,7 +1027,6 @@ calculate_scores() {
 
         # ==================================================
         # Latency Score
-        # 延迟越低越好
         # ==================================================
 
         if awk \
@@ -1035,26 +1038,11 @@ calculate_scores() {
         then
 
             latency_score=$(
-                awk \
-                    -v min="$min_latency" \
-                    -v max="$max_latency" \
-                    -v value="$latency" \
-                    'BEGIN {
-                        score=((max-value)/(max-min))*100
-
-                        if (score < 0)
-                            score=0
-
-                        if (score > 100)
-                            score=100
-
-                        printf "%.4f", score
-                    }'
-            )
+				awk -v min="$min_latency" -v max="$max_latency" -v value="$latency" 'BEGIN { score=((max-value)/(max-min))*100; if (score<0) score=0; if (score>100) score=100; printf "%.4f", score }'
+			)
 
         else
 
-            # 所有节点延迟相同
             latency_score="100"
 
         fi
@@ -1062,13 +1050,6 @@ calculate_scores() {
 
         # ==================================================
         # Region Score
-        #
-        # get_api_nodes() 已经进行了地区过滤：
-        #
-        # SG -> SIN
-        # JP -> NRT
-        #
-        # 所以当前节点全部属于目标地区。
         # ==================================================
 
         if [[ "${NODE_REGIONS[$i]:-}" == "$API_REGION" ]]; then
@@ -1084,17 +1065,12 @@ calculate_scores() {
 
         carrier_score="0"
 
+
         carrier_lower=$(
             printf '%s' "${NODE_CARRIERS[$i]:-}" |
             tr '[:upper:]' '[:lower:]'
         )
 
-        local preferred_carrier_lower
-
-        preferred_carrier_lower=$(
-            printf '%s' "$PREFERRED_CARRIER" |
-            tr '[:upper:]' '[:lower:]'
-        )
 
         if [[ "$carrier_lower" == "$preferred_carrier_lower" ]]; then
             carrier_score="100"
@@ -1103,27 +1079,10 @@ calculate_scores() {
 
         # ==================================================
         # 综合评分
-        #
-        # Speed    50%
-        # Latency  30%
-        # Region   15%
-        # Carrier   5%
         # ==================================================
 
         final_score=$(
-			awk \
-				-v speed="$speed_score" \
-				-v latency="$latency_score" \
-				-v region="$region_score" \
-				-v carrier="$carrier_score" \
-				-v sw="$SPEED_WEIGHT" \
-				-v lw="$LATENCY_WEIGHT" \
-				-v rw="$REGION_WEIGHT" \
-				-v cw="$CARRIER_WEIGHT" \
-				'BEGIN {
-					score = speed * sw / 100 + latency * lw / 100 + region * rw / 100 + carrier * cw / 100
-					printf "%.4f", score
-				}'
+			awk -v speed="$speed_score" -v latency="$latency_score" -v region="$region_score" -v carrier="$carrier_score" -v sw="$SPEED_WEIGHT" -v lw="$LATENCY_WEIGHT" -v rw="$REGION_WEIGHT" -v cw="$CARRIER_WEIGHT" 'BEGIN { score=speed*sw/100+latency*lw/100+region*rw/100+carrier*cw/100; printf "%.4f", score }'
 		)
 
 
@@ -1135,8 +1094,10 @@ calculate_scores() {
     log INFO \
         "[$TARGET_REGION] 评分完成：Speed=${SPEED_WEIGHT}% Latency=${LATENCY_WEIGHT}% Region=${REGION_WEIGHT}% Carrier=${CARRIER_WEIGHT}%"
 
+
     return 0
 }
+
 
 # ==========================================================
 # 节点排序
@@ -1216,12 +1177,6 @@ sort_nodes_by_score() {
 
 # ==========================================================
 # 获取指定地区优选 IP
-#
-# 最终：
-#
-# IPS
-#
-# 为当前地区独立 IP 池
 # ==========================================================
 
 get_preferred_ips() {
@@ -1233,13 +1188,11 @@ get_preferred_ips() {
 
 
     if ! get_api_nodes "$TARGET_REGION"; then
-
         return 1
     fi
 
 
     if ! sort_nodes_by_score "$TARGET_REGION"; then
-
         return 1
     fi
 
@@ -1268,6 +1221,9 @@ get_preferred_ips() {
 
 # ==========================================================
 # 获取 Cloudflare DNS A 记录
+#
+# 输出：
+#   ID|IP
 # ==========================================================
 
 get_dns_records() {
@@ -1348,7 +1304,7 @@ ips_equal() {
     CURRENT_SORTED=$(
         printf '%s\n' "$CURRENT" |
         sed '/^$/d' |
-        sort
+        sort -u
     )
 
 
@@ -1357,7 +1313,7 @@ ips_equal() {
     TARGET_SORTED=$(
         printf '%s\n' "$TARGET" |
         sed '/^$/d' |
-        sort
+        sort -u
     )
 
 
@@ -1367,12 +1323,18 @@ ips_equal() {
 
 # ==========================================================
 # 创建 DNS
+#
+# 成功后：
+#   CREATED_RECORD_ID
 # ==========================================================
 
 create_dns_record() {
 
     local DOMAIN="$1"
     local IP="$2"
+
+
+    CREATED_RECORD_ID=""
 
 
     local DATA
@@ -1442,7 +1404,23 @@ create_dns_record() {
     fi
 
 
-    log INFO "$DOMAIN -> $IP：创建成功"
+    CREATED_RECORD_ID=$(
+        echo "$RESPONSE" |
+        jq -r '.result.id // empty'
+    )
+
+
+    if [ -z "$CREATED_RECORD_ID" ]; then
+
+        log ERROR "$DOMAIN -> $IP：创建成功但没有返回记录 ID"
+
+        return 1
+    fi
+
+
+    log INFO \
+        "$DOMAIN -> $IP：创建成功 ID=$CREATED_RECORD_ID"
+
 
     return 0
 }
@@ -1476,6 +1454,14 @@ delete_dns_record() {
     fi
 
 
+    if ! echo "$RESPONSE" | jq empty >/dev/null 2>&1; then
+
+        log ERROR "$DOMAIN：删除记录 $RECORD_ID 返回无效 JSON"
+
+        return 1
+    fi
+
+
     local SUCCESS
 
     SUCCESS=$(
@@ -1500,101 +1486,121 @@ delete_dns_record() {
     fi
 
 
-    log INFO "$DOMAIN：删除旧记录成功 ID=$RECORD_ID"
+    log INFO \
+        "$DOMAIN：删除旧记录成功 ID=$RECORD_ID"
+
 
     return 0
 }
 
 
 # ==========================================================
-# 生成当前地区目标 IP
+# 随机选择旧 DNS 记录
 #
-# 注意：
-# 这里的偏移只根据当前地区的 DOMAINS 计算
+# 参数：
+#   $1 = 要随机选择的数量
 #
-# SG 不会使用 JP 的偏移
-# JP 不会使用 SG 的偏移
+# 使用：
+#   RANDOM_DELETE_IDS
+#   RANDOM_DELETE_IPS
+#
+# 这里使用 Bash RANDOM，不依赖 shuf。
 # ==========================================================
 
-generate_target_ips() {
+select_random_old_records() {
 
-    local DOMAIN_INDEX="$1"
-    local IP_COUNT="$2"
-
-
-    TARGET_IPS=()
+    local SELECT_COUNT="$1"
 
 
-    local TOTAL_IPS="${#IPS[@]}"
+    RANDOM_DELETE_IDS=()
+    RANDOM_DELETE_IPS=()
 
 
-    if [ "$TOTAL_IPS" -eq 0 ]; then
+    local TOTAL="${#CURRENT_RECORD_IDS[@]}"
 
-        return 1
+
+    if [ "$SELECT_COUNT" -le 0 ]; then
+        return 0
     fi
 
 
-    local GLOBAL_OFFSET=0
+    if [ "$SELECT_COUNT" -gt "$TOTAL" ]; then
+        SELECT_COUNT="$TOTAL"
+    fi
 
-    local K
+
+    # ------------------------------------------------------
+    # 建立索引数组
+    # ------------------------------------------------------
+
+    local INDEXES=()
+
+    local i
+
+    for ((i=0; i<TOTAL; i++)); do
+        INDEXES+=("$i")
+    done
 
 
-    for ((K=0; K<DOMAIN_INDEX; K++)); do
+    # ------------------------------------------------------
+    # Fisher-Yates 随机洗牌
+    # ------------------------------------------------------
 
-        GLOBAL_OFFSET=$(
-            (
-                echo "$GLOBAL_OFFSET + ${DOMAIN_IP_COUNTS[$K]}"
-            ) |
-            bc
+    local j
+    local TEMP
+    local RANDOM_INDEX
+
+
+    for ((i=TOTAL-1; i>0; i--)); do
+
+        RANDOM_INDEX=$((RANDOM % (i + 1)))
+
+
+        TEMP="${INDEXES[$i]}"
+
+        INDEXES[$i]="${INDEXES[$RANDOM_INDEX]}"
+
+        INDEXES[$RANDOM_INDEX]="$TEMP"
+
+    done
+
+
+    # ------------------------------------------------------
+    # 取前 SELECT_COUNT 个
+    # ------------------------------------------------------
+
+    for ((i=0; i<SELECT_COUNT; i++)); do
+
+        local IDX="${INDEXES[$i]}"
+
+
+        RANDOM_DELETE_IDS+=(
+            "${CURRENT_RECORD_IDS[$IDX]}"
+        )
+
+
+        RANDOM_DELETE_IPS+=(
+            "${CURRENT_RECORD_IPS[$IDX]}"
         )
 
     done
-
-
-    local J
-    local IP_INDEX
-
-
-    for ((J=0; J<IP_COUNT; J++)); do
-
-        IP_INDEX=$(( (GLOBAL_OFFSET + J) % TOTAL_IPS ))
-
-        TARGET_IPS+=("${IPS[$IP_INDEX]}")
-
-    done
-
-
-    # ------------------------------------------------------
-    # 去重
-    # ------------------------------------------------------
-
-    local UNIQUE=()
-
-    declare -A SEEN=()
-
-
-    local IP
-
-
-    for IP in "${TARGET_IPS[@]}"; do
-
-        if [ -z "${SEEN[$IP]+x}" ]; then
-
-            UNIQUE+=("$IP")
-
-            SEEN["$IP"]=1
-
-        fi
-
-    done
-
-
-    TARGET_IPS=("${UNIQUE[@]}")
 }
 
 
 # ==========================================================
 # 处理单个域名
+#
+# 核心策略：
+#
+# current < target
+#   -> 只补新 IP
+#   -> 不删除旧 IP
+#
+# current = target
+#   -> 新 IP 随机淘汰旧 IP
+#
+# current > target
+#   -> 不主动删除，避免破坏现有 DNS
 # ==========================================================
 
 process_domain() {
@@ -1609,26 +1615,7 @@ process_domain() {
 
     log INFO "[$TARGET_REGION] 处理：$DOMAIN"
 
-    log INFO "[$TARGET_REGION] IP 数量：$IP_COUNT"
-
-
-    # ------------------------------------------------------
-    # 生成目标 IP
-    # ------------------------------------------------------
-
-    if ! generate_target_ips \
-        "$DOMAIN_INDEX" \
-        "$IP_COUNT"
-    then
-
-        log ERROR "[$TARGET_REGION] $DOMAIN：无法生成目标 IP"
-
-        return 1
-    fi
-
-
-    log INFO \
-        "[$TARGET_REGION] $DOMAIN 目标 IP：${TARGET_IPS[*]}"
+    log INFO "[$TARGET_REGION] 配置 IP 数量：$IP_COUNT"
 
 
     # ------------------------------------------------------
@@ -1647,177 +1634,595 @@ process_domain() {
     fi
 
 
-    local CURRENT_IPS
-    local CURRENT_IDS
-
-
-    CURRENT_IPS=$(
-        echo "$RECORD_DATA" |
-        cut -d'|' -f2
-    )
-
-
-    CURRENT_IDS=$(
-        echo "$RECORD_DATA" |
-        cut -d'|' -f1
-    )
-
-
     # ------------------------------------------------------
-    # 比较 IP
+    # 解析当前 DNS
     # ------------------------------------------------------
 
-    local TARGET_TEXT
+    CURRENT_RECORD_IDS=()
+    CURRENT_RECORD_IPS=()
 
 
-    TARGET_TEXT=$(
-        printf '%s\n' "${TARGET_IPS[@]}"
-    )
+    local RECORD_ID
+    local RECORD_IP
 
 
-    if ips_equal "$CURRENT_IPS" "$TARGET_TEXT"; then
+    while IFS='|' read -r RECORD_ID RECORD_IP; do
+
+        [ -z "$RECORD_ID" ] && continue
+        [ -z "$RECORD_IP" ] && continue
+
+
+        CURRENT_RECORD_IDS+=("$RECORD_ID")
+        CURRENT_RECORD_IPS+=("$RECORD_IP")
+
+    done <<< "$RECORD_DATA"
+
+
+    local CURRENT_COUNT="${#CURRENT_RECORD_IDS[@]}"
+
+
+    if [ "$CURRENT_COUNT" -gt 0 ]; then
 
         log INFO \
-            "[$TARGET_REGION] $DOMAIN：IP 未变化，跳过"
-
-        return 0
-    fi
-
-
-    if [ -n "$CURRENT_IPS" ]; then
+            "[$TARGET_REGION] $DOMAIN 当前 DNS 数量：$CURRENT_COUNT"
 
         log INFO \
-            "[$TARGET_REGION] $DOMAIN 当前 IP：${CURRENT_IPS//$'\n'/ }"
+            "[$TARGET_REGION] $DOMAIN 当前 IP：${CURRENT_RECORD_IPS[*]}"
 
     else
 
         log INFO \
-            "[$TARGET_REGION] $DOMAIN 当前 IP：无"
+            "[$TARGET_REGION] $DOMAIN 当前没有 A 记录"
 
     fi
 
 
-    log INFO \
-        "[$TARGET_REGION] $DOMAIN 目标 IP：${TARGET_IPS[*]}"
-
-
     # ------------------------------------------------------
-    # 先创建新记录
+    # 建立当前 DNS IP 集合
     # ------------------------------------------------------
 
-    CREATED_IPS=()
-
-    local CREATE_FAILED=0
+    declare -A CURRENT_IP_SET=()
 
 
-    local IP
+    for RECORD_IP in "${CURRENT_RECORD_IPS[@]}"; do
 
-
-    for IP in "${TARGET_IPS[@]}"; do
-
-        if create_dns_record "$DOMAIN" "$IP"; then
-
-            CREATED_IPS+=("$IP")
-
-        else
-
-            CREATE_FAILED=1
-
-            break
-
-        fi
+        CURRENT_IP_SET["$RECORD_IP"]=1
 
     done
 
 
     # ------------------------------------------------------
-    # 新记录创建失败
+    # 找出真正的新 IP
+    #
+    # IPS 已经按照综合评分从高到低排序。
+    #
+    # 因此：
+    #   新 IP 的优先级也是从高到低。
     # ------------------------------------------------------
 
-    if [ "$CREATE_FAILED" -eq 1 ]; then
+    NEW_IPS=()
 
-        log ERROR \
-            "[$TARGET_REGION] $DOMAIN：新记录创建失败"
-
-        log ERROR \
-            "[$TARGET_REGION] $DOMAIN：保留原有记录，不删除"
+    declare -A NEW_IP_SET=()
 
 
-        local NEW_DATA
+    local API_IP
 
 
-        NEW_DATA=$(get_dns_records "$DOMAIN" 2>/dev/null || true)
+    for API_IP in "${IPS[@]}"; do
+
+        [ -z "$API_IP" ] && continue
 
 
-        local RECORD_ID
-        local RECORD_IP
-        local CREATED_IP
+        # 已经在当前 DNS 中
+        if [ -n "${CURRENT_IP_SET[$API_IP]+x}" ]; then
+            continue
+        fi
 
 
-        while IFS='|' read -r RECORD_ID RECORD_IP; do
+        # 防止 API 自身重复
+        if [ -n "${NEW_IP_SET[$API_IP]+x}" ]; then
+            continue
+        fi
 
-            [ -z "$RECORD_ID" ] && continue
+
+        NEW_IP_SET["$API_IP"]=1
+
+        NEW_IPS+=("$API_IP")
+
+    done
 
 
-            for CREATED_IP in "${CREATED_IPS[@]}"; do
+    local NEW_COUNT="${#NEW_IPS[@]}"
 
-                if [ "$RECORD_IP" = "$CREATED_IP" ]; then
 
-                    delete_dns_record \
-                        "$DOMAIN" \
-                        "$RECORD_ID" \
-                        || true
+    log INFO \
+        "[$TARGET_REGION] $DOMAIN API 真正新增 IP：$NEW_COUNT"
+
+
+    if [ "$NEW_COUNT" -gt 0 ]; then
+
+        log INFO \
+            "[$TARGET_REGION] $DOMAIN 新 IP：${NEW_IPS[*]}"
+
+    fi
+
+
+    # ======================================================
+    # 情况一：
+    #
+    # 当前 DNS 数量已经超过配置数量
+    #
+    # 用户没有要求自动缩减，因此安全处理：
+    # 保留现有 DNS，不删除。
+    #
+    # 后续如果用户主动修改配置数量，再重新处理。
+    # ======================================================
+
+    if [ "$CURRENT_COUNT" -gt "$IP_COUNT" ]; then
+
+        log WARN \
+            "[$TARGET_REGION] $DOMAIN：当前 DNS 数量 $CURRENT_COUNT > 配置数量 $IP_COUNT"
+
+        log WARN \
+            "[$TARGET_REGION] $DOMAIN：按照安全策略，本次不删除任何现有 IP"
+
+        return 0
+    fi
+
+
+    # ======================================================
+    # 情况二：
+    #
+    # 当前 DNS 数量 < 配置数量
+    #
+    # 只补 IP。
+    #
+    # 绝对不删除旧 IP。
+    # ======================================================
+
+    if [ "$CURRENT_COUNT" -lt "$IP_COUNT" ]; then
+
+        local NEED_COUNT=$((IP_COUNT - CURRENT_COUNT))
+
+
+        if [ "$NEW_COUNT" -eq 0 ]; then
+
+            log INFO \
+                "[$TARGET_REGION] $DOMAIN：当前 $CURRENT_COUNT/$IP_COUNT"
+
+            log INFO \
+                "[$TARGET_REGION] $DOMAIN：没有新的可用 IP，本次保持不变"
+
+            return 0
+        fi
+
+
+        local ADD_COUNT="$NEW_COUNT"
+
+
+        if [ "$ADD_COUNT" -gt "$NEED_COUNT" ]; then
+            ADD_COUNT="$NEED_COUNT"
+        fi
+
+
+        log INFO \
+            "[$TARGET_REGION] $DOMAIN：当前 $CURRENT_COUNT/$IP_COUNT，需要补 $NEED_COUNT 个 IP"
+
+        log INFO \
+            "[$TARGET_REGION] $DOMAIN：本次准备添加 $ADD_COUNT 个新 IP"
+
+
+        # --------------------------------------------------
+        # 选择最高评分的新 IP
+        # --------------------------------------------------
+
+        IPS_TO_ADD=()
+
+
+        local ADD_INDEX
+
+
+        for ((ADD_INDEX=0; ADD_INDEX<ADD_COUNT; ADD_INDEX++)); do
+
+            IPS_TO_ADD+=("${NEW_IPS[$ADD_INDEX]}")
+
+        done
+
+
+        # --------------------------------------------------
+        # 创建新记录
+        # --------------------------------------------------
+
+        CREATED_RECORD_IDS=()
+        CREATED_RECORD_IPS=()
+
+
+        local CREATE_FAILED=0
+        local ADD_IP
+
+
+        for ADD_IP in "${IPS_TO_ADD[@]}"; do
+
+            if create_dns_record "$DOMAIN" "$ADD_IP"; then
+
+                CREATED_RECORD_IDS+=("$CREATED_RECORD_ID")
+                CREATED_RECORD_IPS+=("$ADD_IP")
+
+            else
+
+                CREATE_FAILED=1
+
+                log ERROR \
+                    "[$TARGET_REGION] $DOMAIN：添加 $ADD_IP 失败"
+
+                break
+
+            fi
+
+        done
+
+
+        # --------------------------------------------------
+        # 创建失败
+        #
+        # 不删除旧 DNS。
+        # 回滚本次成功创建的新记录。
+        # --------------------------------------------------
+
+        if [ "$CREATE_FAILED" -eq 1 ]; then
+
+            log ERROR \
+                "[$TARGET_REGION] $DOMAIN：补 IP 过程中发生失败"
+
+            log ERROR \
+                "[$TARGET_REGION] $DOMAIN：原有 DNS 记录保持不变"
+
+
+            local CREATED_ID
+
+
+            for CREATED_ID in "${CREATED_RECORD_IDS[@]}"; do
+
+                if ! delete_dns_record \
+                    "$DOMAIN" \
+                    "$CREATED_ID"
+                then
+
+                    log ERROR \
+                        "[$TARGET_REGION] $DOMAIN：回滚新记录失败 ID=$CREATED_ID"
 
                 fi
 
             done
 
-        done <<< "$NEW_DATA"
+
+            return 1
+        fi
 
 
-        return 1
+        # --------------------------------------------------
+        # 最终数量
+        # --------------------------------------------------
+
+        local FINAL_COUNT=$(
+            echo "$CURRENT_COUNT + ${#CREATED_RECORD_IDS[@]}" |
+            awk '{print $1+$3}'
+        )
+
+
+        if [ "$FINAL_COUNT" -gt "$IP_COUNT" ]; then
+            FINAL_COUNT="$IP_COUNT"
+        fi
+
+
+        log INFO \
+            "[$TARGET_REGION] $DOMAIN：补 IP 完成，当前预计 $FINAL_COUNT/$IP_COUNT"
+
+
+        if [ "$FINAL_COUNT" -lt "$IP_COUNT" ]; then
+
+            log INFO \
+                "[$TARGET_REGION] $DOMAIN：API 当前 IP 不足，剩余数量等待后续 Cron 补充"
+
+        else
+
+            log INFO \
+                "[$TARGET_REGION] $DOMAIN：已经补满 $IP_COUNT 个 IP"
+
+        fi
+
+
+        return 0
     fi
 
 
-    # ------------------------------------------------------
-    # 删除旧记录
-    # ------------------------------------------------------
+    # ======================================================
+    # 情况三：
+    #
+    # 当前 DNS 已经达到配置数量
+    #
+    # 新 IP 出现：
+    #   新 IP 随机淘汰旧 IP
+    #
+    # 新增多少：
+    #   淘汰多少
+    #
+    # 最终数量保持 IP_COUNT
+    # ======================================================
 
-    local DELETE_FAILED=0
+    if [ "$CURRENT_COUNT" -eq "$IP_COUNT" ]; then
+
+        if [ "$NEW_COUNT" -eq 0 ]; then
+
+            log INFO \
+                "[$TARGET_REGION] $DOMAIN：已达到 $IP_COUNT/$IP_COUNT"
+
+            log INFO \
+                "[$TARGET_REGION] $DOMAIN：没有新的 API IP，本次不更新"
+
+            return 0
+        fi
 
 
-    if [ -n "$CURRENT_IDS" ]; then
-
-        while read -r RECORD_ID; do
-
-            [ -z "$RECORD_ID" ] && continue
+        local ROTATE_COUNT="$NEW_COUNT"
 
 
-            if ! delete_dns_record \
-                "$DOMAIN" \
-                "$RECORD_ID"
-            then
+        if [ "$ROTATE_COUNT" -gt "$IP_COUNT" ]; then
+            ROTATE_COUNT="$IP_COUNT"
+        fi
 
-                DELETE_FAILED=1
+
+        # --------------------------------------------------
+        # 选择排名最高的 NEW IP
+        # --------------------------------------------------
+
+        IPS_TO_ADD=()
+
+
+        local ROTATE_INDEX
+
+
+        for ((ROTATE_INDEX=0; ROTATE_INDEX<ROTATE_COUNT; ROTATE_INDEX++)); do
+
+            IPS_TO_ADD+=("${NEW_IPS[$ROTATE_INDEX]}")
+
+        done
+
+
+        log INFO \
+            "[$TARGET_REGION] $DOMAIN：检测到 $NEW_COUNT 个新 IP"
+
+        log INFO \
+            "[$TARGET_REGION] $DOMAIN：本次轮换 $ROTATE_COUNT 个 IP"
+
+        log INFO \
+            "[$TARGET_REGION] $DOMAIN：准备加入：${IPS_TO_ADD[*]}"
+
+
+        # --------------------------------------------------
+        # 随机选择旧 IP
+        # --------------------------------------------------
+
+        select_random_old_records "$ROTATE_COUNT"
+
+
+        log INFO \
+            "[$TARGET_REGION] $DOMAIN：随机淘汰旧 IP：${RANDOM_DELETE_IPS[*]}"
+
+
+        # --------------------------------------------------
+        # 先创建新 IP
+        #
+        # 安全原则：
+        #
+        # 创建成功之后才删除旧 IP。
+        # --------------------------------------------------
+
+        CREATED_RECORD_IDS=()
+        CREATED_RECORD_IPS=()
+
+
+        local CREATE_FAILED=0
+
+
+        for ADD_IP in "${IPS_TO_ADD[@]}"; do
+
+            if create_dns_record "$DOMAIN" "$ADD_IP"; then
+
+                CREATED_RECORD_IDS+=("$CREATED_RECORD_ID")
+                CREATED_RECORD_IPS+=("$ADD_IP")
+
+            else
+
+                CREATE_FAILED=1
+
+                log ERROR \
+                    "[$TARGET_REGION] $DOMAIN：创建新 IP $ADD_IP 失败"
+
+                break
 
             fi
 
-        done <<< "$CURRENT_IDS"
+        done
 
+
+        # --------------------------------------------------
+        # 创建失败
+        #
+        # 绝对不删除旧 IP。
+        # 回滚已经创建的新 IP。
+        # --------------------------------------------------
+
+        if [ "$CREATE_FAILED" -eq 1 ]; then
+
+            log ERROR \
+                "[$TARGET_REGION] $DOMAIN：新 IP 创建失败"
+
+            log ERROR \
+                "[$TARGET_REGION] $DOMAIN：不会删除任何旧 IP"
+
+
+            local CREATED_ID
+
+
+            for CREATED_ID in "${CREATED_RECORD_IDS[@]}"; do
+
+                if ! delete_dns_record \
+                    "$DOMAIN" \
+                    "$CREATED_ID"
+                then
+
+                    log ERROR \
+                        "[$TARGET_REGION] $DOMAIN：新 IP 回滚失败 ID=$CREATED_ID"
+
+                fi
+
+            done
+
+
+            return 1
+        fi
+
+
+        # --------------------------------------------------
+        # 新 IP 全部创建成功
+        #
+        # 现在开始删除随机旧 IP
+        # --------------------------------------------------
+
+        local DELETE_FAILED=0
+
+        DELETED_RECORD_IDS=()
+        DELETED_RECORD_IPS=()
+
+
+        local DELETE_INDEX
+        local OLD_ID
+        local OLD_IP
+
+
+        for ((DELETE_INDEX=0; DELETE_INDEX<ROTATE_COUNT; DELETE_INDEX++)); do
+
+            OLD_ID="${RANDOM_DELETE_IDS[$DELETE_INDEX]}"
+            OLD_IP="${RANDOM_DELETE_IPS[$DELETE_INDEX]}"
+
+
+            if delete_dns_record \
+                "$DOMAIN" \
+                "$OLD_ID"
+            then
+
+                DELETED_RECORD_IDS+=("$OLD_ID")
+                DELETED_RECORD_IPS+=("$OLD_IP")
+
+            else
+
+                DELETE_FAILED=1
+
+                log ERROR \
+                    "[$TARGET_REGION] $DOMAIN：删除旧 IP 失败 IP=$OLD_IP ID=$OLD_ID"
+
+                break
+
+            fi
+
+        done
+
+
+        # --------------------------------------------------
+        # 删除失败
+        #
+        # 尝试恢复：
+        #
+        # 1. 重新创建已经删除的旧 IP
+        # 2. 删除本次新增 IP
+        #
+        # 尽可能恢复到更新前状态。
+        # --------------------------------------------------
+
+        if [ "$DELETE_FAILED" -eq 1 ]; then
+
+            log ERROR \
+                "[$TARGET_REGION] $DOMAIN：旧记录删除过程中失败"
+
+            log ERROR \
+                "[$TARGET_REGION] $DOMAIN：开始尝试回滚本次变更"
+
+
+            # ------------------------------------------------
+            # 恢复已经删除的旧 IP
+            # ------------------------------------------------
+
+            local RESTORE_IP
+
+
+            for RESTORE_IP in "${DELETED_RECORD_IPS[@]}"; do
+
+                if create_dns_record "$DOMAIN" "$RESTORE_IP"; then
+
+                    log INFO \
+                        "[$TARGET_REGION] $DOMAIN：旧 IP 恢复成功：$RESTORE_IP"
+
+                else
+
+                    log ERROR \
+                        "[$TARGET_REGION] $DOMAIN：旧 IP 恢复失败：$RESTORE_IP"
+
+                fi
+
+            done
+
+
+            # ------------------------------------------------
+            # 删除本次新增 IP
+            # ------------------------------------------------
+
+            for CREATED_ID in "${CREATED_RECORD_IDS[@]}"; do
+
+                if ! delete_dns_record \
+                    "$DOMAIN" \
+                    "$CREATED_ID"
+                then
+
+                    log ERROR \
+                        "[$TARGET_REGION] $DOMAIN：回滚新 IP 失败 ID=$CREATED_ID"
+
+                fi
+
+            done
+
+
+            log ERROR \
+                "[$TARGET_REGION] $DOMAIN：本次轮换未完全成功，请检查 DNS"
+
+
+            return 1
+        fi
+
+
+        # --------------------------------------------------
+        # 更新成功
+        # --------------------------------------------------
+
+        log INFO \
+            "[$TARGET_REGION] $DOMAIN：IP 轮换成功"
+
+
+        log INFO \
+            "[$TARGET_REGION] $DOMAIN：新增：${IPS_TO_ADD[*]}"
+
+
+        log INFO \
+            "[$TARGET_REGION] $DOMAIN：淘汰：${RANDOM_DELETE_IPS[*]}"
+
+
+        log INFO \
+            "[$TARGET_REGION] $DOMAIN：最终保持 $IP_COUNT 个 IP"
+
+
+        return 0
     fi
 
-
-    if [ "$DELETE_FAILED" -eq 1 ]; then
-
-        log ERROR \
-            "[$TARGET_REGION] $DOMAIN：部分旧记录删除失败"
-
-        return 1
-    fi
-
-
-    log INFO \
-        "[$TARGET_REGION] $DOMAIN：更新成功"
 
     return 0
 }
@@ -1855,7 +2260,7 @@ run_region_update() {
 
 
     # ------------------------------------------------------
-    # 获取当前地区 IP 池
+    # 获取当前地区独立 IP 池
     # ------------------------------------------------------
 
     if ! get_preferred_ips "$TARGET_REGION"; then
@@ -1919,7 +2324,6 @@ run_region_update() {
 
 
     if [ "$FAILED" -gt 0 ]; then
-
         return 1
     fi
 
@@ -1951,9 +2355,7 @@ cron_mode() {
 
 
     if ! run_region_update "SG"; then
-
         SG_RESULT=1
-
     fi
 
 
@@ -1965,9 +2367,7 @@ cron_mode() {
 
 
     if ! run_region_update "JP"; then
-
         JP_RESULT=1
-
     fi
 
 
@@ -2025,13 +2425,9 @@ show_domains() {
 
 
     if [ "$TARGET_REGION" = "SG" ]; then
-
         CONFIG_FILE="$SG_DOMAIN_CONFIG"
-
     else
-
         CONFIG_FILE="$JP_DOMAIN_CONFIG"
-
     fi
 
 
@@ -2291,9 +2687,7 @@ add_multiple_domains() {
 
 
     if [ "$ADD_COUNT" -gt 0 ]; then
-
         save_domains "$TARGET_REGION"
-
     fi
 
 
@@ -2383,12 +2777,10 @@ delete_domain() {
 
 
     unset 'DOMAINS[REAL_INDEX]'
-
     unset 'DOMAIN_IP_COUNTS[REAL_INDEX]'
 
 
     DOMAINS=("${DOMAINS[@]}")
-
     DOMAIN_IP_COUNTS=("${DOMAIN_IP_COUNTS[@]}")
 
 
@@ -2516,7 +2908,6 @@ run_update_region() {
 
 
     if ! check_cloudflare_api; then
-
         return 1
     fi
 
@@ -2537,7 +2928,6 @@ run_update_region() {
 
 
     if ! get_preferred_ips "$TARGET_REGION"; then
-
         return 1
     fi
 
@@ -2597,7 +2987,6 @@ run_update_region() {
 run_update_all() {
 
     if ! check_cloudflare_api; then
-
         return 1
     fi
 
@@ -2695,9 +3084,7 @@ show_api_top10() {
 
 
     if [ "${#SORTED_IPS[@]}" -lt "$LIMIT" ]; then
-
         LIMIT="${#SORTED_IPS[@]}"
-
     fi
 
 
@@ -2755,17 +3142,11 @@ show_all_domain_ips() {
 
 
     local TARGET_REGION
-
     local i
-
     local DOMAIN
-
     local CONFIG_COUNT
-
     local RECORD_DATA
-
     local CURRENT_IPS
-
     local IP_DISPLAY
 
 
@@ -2786,7 +3167,6 @@ show_all_domain_ips() {
             echo "没有配置域名。"
 
             continue
-
         fi
 
 
