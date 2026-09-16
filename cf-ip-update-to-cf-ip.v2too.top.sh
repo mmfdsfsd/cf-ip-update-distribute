@@ -54,7 +54,7 @@ set -o pipefail
 
 CF_API_TOKEN="my-cf-token"
 
-ZONE_ID="my-cf-zone-id"
+ZONE_ID="my-cf-id"
 
 TTL=60
 
@@ -552,16 +552,13 @@ check_cloudflare_api() {
 #
 # API 实际格式：
 #
-# [
-#   {
-#     "ip": "172.64.229.254",
-#     "speed": 81.1,
-#     "latency": 86.69,
-#     "region": "NRT",
-#     "time": "...",
-#     "carrier": "ct"
-#   }
-# ]
+# {
+#   "ct": [ { ... } ],
+#   "cm": [ { ... } ],
+#   "cu": [ { ... } ]
+# }
+#
+# 将所有运营商数组合并后，再按 region / speed 过滤。
 #
 # SG -> SIN
 # JP -> NRT
@@ -640,16 +637,6 @@ get_api_nodes() {
         return 1
     fi
 
-
-    if ! echo "$RESPONSE" |
-        jq -e 'type == "array"' >/dev/null 2>&1; then
-
-        log ERROR "[$TARGET_REGION] API 返回的数据不是 JSON 数组"
-
-        return 1
-    fi
-
-
     while IFS=$'\t' read -r \
         IP \
         SPEED \
@@ -718,8 +705,14 @@ get_api_nodes() {
 
         echo "$RESPONSE" |
         jq -r '
-            .[] |
             [
+                (.ct // []),
+                (.cm // []),
+                (.cu // [])
+            ]
+            | add
+            | .[]
+            | [
                 (.ip // ""),
                 (.speed // 0),
                 (.latency // 999999),
