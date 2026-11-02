@@ -52,9 +52,9 @@ set -o pipefail
 # Cloudflare 配置
 # ==========================================================
 
-CF_API_TOKEN="my-cf-token"
+CF_API_TOKEN="YvkOMowzv6qdEP1234567890EiDZgbubGLm9ksjhFvnWW"
 
-ZONE_ID="my-cf-id"
+ZONE_ID="e7eb4b0d773123456789065c7f7cd23bfc0"
 
 TTL=60
 
@@ -67,7 +67,33 @@ PROXIED=false
 # 优选 IP API
 # ==========================================================
 
-IP_API="https://ip.v2too.top/api/nodes"
+#IP_API="https://ip.v2too.top/api/nodes?carrier=ct"
+IP_API="https://cfbestip.awsno.com/api/nodes?carrier=ct"
+
+
+# ==========================================================
+# API 响应缓存
+#
+# 修改记录：
+#   2026-11-02
+#   SG / JP 共用一次 API 请求结果，避免跨地区触发
+#   API 的 30 秒请求频率限制。
+# ==========================================================
+
+API_RESPONSE_CACHE=""
+API_RESPONSE_CACHE_LOADED=0
+
+
+# ==========================================================
+# 重置本轮 API 响应缓存
+# ==========================================================
+
+reset_api_response_cache() {
+
+    API_RESPONSE_CACHE=""
+    API_RESPONSE_CACHE_LOADED=0
+
+}
 
 
 # ==========================================================
@@ -550,18 +576,27 @@ check_cloudflare_api() {
 # ==========================================================
 # 获取指定地区 API 节点
 #
-# API 实际格式：
+# 新 API 格式：
 #
-# {
-#   "ct": [ { ... } ],
-#   "cm": [ { ... } ],
-#   "cu": [ { ... } ]
-# }
+# https://ip.v2too.top/api/nodes?carrier=ct
 #
-# 将所有运营商数组合并后，再按 region / speed 过滤。
+# 返回：
+#
+# [
+#   {
+#     "ip": "104.16.149.27",
+#     "speed": 0.23,
+#     "latency": 81.65,
+#     "region": "SIN",
+#     "time": "2026-09-16 20:13",
+#     "carrier": "ct"
+#   }
+# ]
 #
 # SG -> SIN
 # JP -> NRT
+#
+# API 已经通过 ?carrier=ct 进行运营商筛选。
 # ==========================================================
 
 get_api_nodes() {
@@ -611,30 +646,188 @@ get_api_nodes() {
     log INFO "[$TARGET_REGION] API 地区过滤：region=$API_REGION"
 
 
+
+    # ------------------------------------------------------
+    # 2026-11-02 修改：
+    # SG / JP 共用同一份 API 原始响应。
+    #
+    # 首次调用：
+    #   请求 API，验证响应并缓存。
+    #
+    # 后续调用：
+    #   直接读取缓存，不再请求 API。
+    #
+    # 如果 API 返回 30 秒频率限制：
+    #   等待 31 秒后自动重试一次。
+    # ------------------------------------------------------
+
     local RESPONSE
 
 
-    RESPONSE=$(
-        curl -L -sS \
-            --connect-timeout 10 \
-            --max-time 30 \
-            "$IP_API"
-    )
+    if [ "${API_RESPONSE_CACHE_LOADED:-0}" -eq 1 ]; then
+
+        RESPONSE="$API_RESPONSE_CACHE"
+
+        log INFO \
+            "[$TARGET_REGION] 使用本轮已缓存的 API 响应，不重复请求"
 
 
-    if [ -z "$RESPONSE" ]; then
+    else
 
-        log ERROR "[$TARGET_REGION] 优选 IP API 无返回"
+        local ATTEMPT=1
+        local MAX_ATTEMPTS=2
+        local RATE_LIMIT_MESSAGE
 
-        return 1
+
+        while [ "$ATTEMPT" -le "$MAX_ATTEMPTS" ]; do
+
+            log INFO \
+                "[$TARGET_REGION] 请求优选 IP API（第 $ATTEMPT 次）：$IP_API"
+
+
+            RESPONSE=$(
+                curl -L -sS \
+                    --connect-timeout 10 \
+                    --max-time 30 \
+                    "$IP_API"
+            )
+
+
+            if [ -z "$RESPONSE" ]; then
+
+                log ERROR \
+                    "[$TARGET_REGION] 优选 IP API 无返回"
+
+                return 1
+            fi
+
+
+            if ! echo "$RESPONSE" | jq empty >/dev/null 2>&1; then
+
+                log ERROR \
+                    "[$TARGET_REGION] 优选 IP API 返回无效 JSON"
+
+                log ERROR \
+                    "[$TARGET_REGION] 响应内容：$(printf '%s' "$RESPONSE" | head -c 500)"
+
+                return 1
+            fi
+
+
+            # --------------------------------------------------
+            # 检查 API 是否触发 30 秒频率限制
+            # --------------------------------------------------
+
+            RATE_LIMIT_MESSAGE=$(
+                echo "$RESPONSE" |
+                jq -r '
+                    if type == "object" then
+                        (.message // "")
+                    else
+                        ""
+                    end
+                ' 2>/dev/null
+            )
+
+
+            if [[ "$RATE_LIMIT_MESSAGE" == *"30秒后再请求"* ]]; then
+
+                if [ "$ATTEMPT" -lt "$MAX_ATTEMPTS" ]; then
+
+                    log WARN \
+                        "[$TARGET_REGION] API 触发 30 秒频率限制，等待 31 秒后重试"
+
+                    sleep 31
+
+                    ((ATTEMPT++))
+
+                    continue
+
+                else
+
+                    log ERROR \
+                        "[$TARGET_REGION] 等待后 API 仍然触发频率限制"
+
+                    return 1
+
+                fi
+
+            fi
+
+
+            # --------------------------------------------------
+            # 验证 API 顶层结构
+            # --------------------------------------------------
+
+            local JSON_TYPE
+
+            JSON_TYPE=$(echo "$RESPONSE" | jq -r 'type' 2>/dev/null)
+
+
+            if [ "$JSON_TYPE" != "array" ]; then
+
+                log ERROR \
+                    "[$TARGET_REGION] API 返回结构错误：期望 array，实际为 ${JSON_TYPE:-INVALID}"
+
+                log ERROR \
+                    "[$TARGET_REGION] 异常响应内容：$(printf '%s' "$RESPONSE" | head -c 500)"
+
+                log ERROR \
+                    "[$TARGET_REGION] 本次不会使用异常数据更新 DNS"
+
+                return 1
+
+            fi
+
+
+            # --------------------------------------------------
+            # 只缓存有效 JSON 数组
+            # --------------------------------------------------
+
+            API_RESPONSE_CACHE="$RESPONSE"
+
+            API_RESPONSE_CACHE_LOADED=1
+
+            break
+
+        done
+
     fi
 
+	# ------------------------------------------------------
+    # 2026-11-02 修改：
+    # 提前解析 JSON，并跳过非 object 类型节点。
+    # 同时验证字段类型，避免 jq 将 boolean 当作节点。
+    # ------------------------------------------------------
 
-    if ! echo "$RESPONSE" | jq empty >/dev/null 2>&1; then
+    local NODE_ROWS
 
-        log ERROR "[$TARGET_REGION] 优选 IP API 返回无效 JSON"
+
+    if ! NODE_ROWS=$(
+        jq -r '
+            if type != "array" then
+                error("top-level JSON must be an array")
+            else
+                .[]
+                | select(type == "object")
+                | [
+                    (if (.ip | type) == "string" then .ip else "" end),
+                    (if (.speed | type) == "number" or (.speed | type) == "string" then .speed else 0 end),
+                    (if (.latency | type) == "number" or (.latency | type) == "string" then .latency else 999999 end),
+                    (if (.region | type) == "string" then .region else "UNKNOWN" end),
+                    (if (.time | type) == "string" then .time else "UNKNOWN" end),
+                    (if (.carrier | type) == "string" then .carrier else "UNKNOWN" end)
+                ]
+                | @tsv
+            end
+        ' <<< "$RESPONSE"
+    ); then
+
+        log ERROR \
+            "[$TARGET_REGION] API 节点数据解析失败"
 
         return 1
+
     fi
 
     while IFS=$'\t' read -r \
@@ -701,28 +894,7 @@ get_api_nodes() {
         NODE_TIMES+=("${TIME:-UNKNOWN}")
         NODE_CARRIERS+=("${CARRIER:-UNKNOWN}")
 
-    done < <(
-
-        echo "$RESPONSE" |
-        jq -r '
-            [
-                (.ct // []),
-                (.cm // []),
-                (.cu // [])
-            ]
-            | add
-            | .[]
-            | [
-                (.ip // ""),
-                (.speed // 0),
-                (.latency // 999999),
-                (.region // "UNKNOWN"),
-                (.time // "UNKNOWN"),
-                (.carrier // "UNKNOWN")
-            ] |
-            @tsv
-        '
-    )
+	done <<< "$NODE_ROWS"
 
 
     if [ "${#NODE_IPS[@]}" -eq 0 ]; then
@@ -2226,11 +2398,35 @@ process_domain() {
 #
 # 参数：
 #   $1 = SG / JP
+#   $2... = 已获取并排序的 IP 池（可选）
+#
+# 修改记录：
+#   2026-11-02
+#   手动更新时复用预览阶段获取的 IP 池，
+#   避免短时间内重复请求优选 IP API，触发 30 秒频率限制。
+#
+# 兼容原有调用：
+#   run_region_update "SG"
+#   run_region_update "JP"
+#
+# 新调用方式：
+#   run_region_update "JP" "${IPS[@]}"
 # ==========================================================
 
 run_region_update() {
 
     local TARGET_REGION="$1"
+
+    shift
+
+    # ------------------------------------------------------
+    # 2026-11-02 修改：
+    # 接收调用方传入的 IP 池。
+    # 如果没有传入 IP，则保留原来的 API 获取流程，
+    # 确保 Cron 和其他原有调用不受影响。
+    # ------------------------------------------------------
+
+    local -a PROVIDED_IPS=("$@")
 
 
     load_domains "$TARGET_REGION"
@@ -2253,15 +2449,30 @@ run_region_update() {
 
 
     # ------------------------------------------------------
-    # 获取当前地区独立 IP 池
+    # 获取或复用当前地区独立 IP 池
     # ------------------------------------------------------
 
-    if ! get_preferred_ips "$TARGET_REGION"; then
+    if [ "${#PROVIDED_IPS[@]}" -gt 0 ]; then
 
-        log ERROR \
-            "[$TARGET_REGION] 获取优选 IP 失败"
+        # 使用手动预览阶段已经获取的 IP 池
+        IPS=("${PROVIDED_IPS[@]}")
 
-        return 1
+        log INFO \
+            "[$TARGET_REGION] 复用已获取的 IP 池，共 ${#IPS[@]} 个 IP"
+
+    else
+
+        # 原有流程：
+        # Cron 或其他未传入 IP 池的调用仍然请求 API
+
+        if ! get_preferred_ips "$TARGET_REGION"; then
+
+            log ERROR \
+                "[$TARGET_REGION] 获取优选 IP 失败"
+
+            return 1
+        fi
+
     fi
 
 
@@ -2325,11 +2536,24 @@ run_region_update() {
 }
 
 
+
 # ==========================================================
 # Cron 模式
 # ==========================================================
 
+
 cron_mode() {
+
+    # ------------------------------------------------------
+    # 2026-11-02 修改：
+    # 每轮 SG + JP 自动任务开始时清空 API 缓存。
+    #
+    # SG 首次请求 API。
+    # JP 复用 SG 请求得到的完整响应。
+    # 两个地区分别筛选 SIN / NRT 节点并独立评分。
+    # ------------------------------------------------------
+
+    reset_api_response_cache
 
     log INFO "=========================================="
     log INFO "Cloudflare SG / JP 自动任务启动"
@@ -2891,14 +3115,26 @@ change_ip_count() {
 }
 
 
+
 # ==========================================================
 # 手动立即执行指定地区
+#
+# 参数：
+#   $1 = SG / JP
+#
+# 修改记录：
+#   2026-11-02
+#   用户确认执行后，将预览阶段获取的 IPS 数组
+#   直接传递给 run_region_update()。
+#   避免再次请求优选 IP API，触发 30 秒频率限制。
 # ==========================================================
 
 run_update_region() {
 
     local TARGET_REGION="$1"
 
+	 # 2026-11-02：每次手动更新开始时使用新的 API 响应
+    reset_api_response_cache
 
     if ! check_cloudflare_api; then
         return 1
@@ -2919,6 +3155,13 @@ run_update_region() {
         return 0
     fi
 
+
+    # ------------------------------------------------------
+    # 获取优选 IP
+    #
+    # 这里获取一次即可。
+    # 后续预览和正式更新共用同一批 IPS。
+    # ------------------------------------------------------
 
     if ! get_preferred_ips "$TARGET_REGION"; then
         return 1
@@ -2962,15 +3205,27 @@ run_update_region() {
             ;;
 
         *)
+
             echo "已取消。"
+
             return
+
             ;;
 
     esac
 
 
-    run_region_update "$TARGET_REGION"
+    # ------------------------------------------------------
+    # 2026-11-02 修改：
+    # 将已经获取的 IPS 数组传递给正式更新函数。
+    #
+    # 不再重复调用 get_preferred_ips()。
+    # 正式更新使用的 IP 与预览显示的 IP 完全一致。
+    # ------------------------------------------------------
+
+    run_region_update "$TARGET_REGION" "${IPS[@]}"
 }
+
 
 
 # ==========================================================
@@ -3023,6 +3278,8 @@ show_api_top10() {
 
     local TARGET_REGION="$1"
 
+	 # 2026-11-02：Top10 查询独立获取最新 API 数据
+    reset_api_response_cache
 
     clear
 
