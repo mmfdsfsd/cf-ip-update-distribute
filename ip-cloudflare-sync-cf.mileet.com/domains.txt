@@ -1,0 +1,3 @@
+jp-vip2-3.awsno.com
+jp-vip2-4.awsno.com
+hk-vip2-1.awsno.com
